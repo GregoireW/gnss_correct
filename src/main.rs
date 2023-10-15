@@ -1,68 +1,86 @@
 #![deny(warnings)]
 #![warn(rust_2018_idioms)]
-use std::io::{Error, stdin};
-use std::thread::sleep;
-use std::time::Duration;
+use std::io::{Error};
 use bytes::Bytes;
-
-use hyper::{Request, Version};
-use tokio::io::{self, AsyncWriteExt as _};
-use tokio::net::TcpStream;
-
-//use tokio_serial::SerialPortBuilderExt;
-
+use hyper::{Request, Response, Version};
 use http_body_util::{BodyExt, Empty};
-use tokio::runtime::Builder;
-use tokio::task::JoinHandle;
+use hyper::body::Incoming;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
+use tokio::net::{TcpListener, TcpStream};
 
+use tokio_serial::{SerialPortBuilderExt, SerialStream};
 
 mod io_utils;
-use io_utils::TokioIo;
+mod app_utils;
 
-type ResultHere<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+//use tokio_serial::SerialPortBuilderExt;
+use crate::app_utils::ResultHere;
+use crate::io_utils::TokioIo;
 
-
-
-fn main() -> ResultHere<()> {
-    let runtime = Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("my-process")
-        .thread_stack_size(2 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .unwrap();
-
+#[tokio::main]
+async fn main() -> ResultHere<()> {
     let url = "http://caster.centipede.fr:2101/GDCRT";
-    let mut ntrip_flux: JoinHandle<ResultHere<()>> = runtime.spawn(fetch_url(url));
 
-    let is_exit: JoinHandle<ResultHere<()>> = runtime.spawn(check_if_exit());
+    #[cfg(unix)]
+    const COM: &str = "/dev/ttyACM0";
+    #[cfg(windows)]
+    const COM: &str = "COM3";
 
+    println!("Will connect to {} and {}", url, COM);
 
-    //let mut port = tokio_serial::new("COM3", 115200).open_native_async();
+    let ntrip_fix = ntrip_fix(url).await?;
 
-    loop{
-        sleep(Duration::from_secs(1));
-        if ntrip_flux.is_finished(){
-            ntrip_flux = runtime.spawn(fetch_url(url));
-        }
-        if is_exit.is_finished(){
-            break;
+    let port = tokio_serial::new(COM, 115200).open_native_async().unwrap();
+    let (mut port_reader, port_writer) = tokio::io::split(port);
+
+    let ntrip_handle=tokio::spawn(copy_ntrip_data(ntrip_fix, port_writer));
+
+    let listener = TcpListener::bind("0.0.0.0:6543").await?;
+
+    let (mut socket, _) = listener.accept().await?;
+    println!("New client connected");
+
+    loop {
+        let mut buffer = [0; 10 * 1024];
+        let read_result =  port_reader.read(&mut buffer).await;
+        if let Ok(len) = read_result {
+            let s=String::from_utf8(buffer[0..len].to_vec()).unwrap();
+            let index = s.find("$GNGGA");
+            if let Some(start)=index {
+                match s.chars().skip(start).collect::<String>().find("\r") {
+                    Some(end) => println!("Fix <- {}", s.chars().skip(start).take(end).collect::<String>()),
+                    None => println!("Fix <- {}", s.chars().skip(start).collect::<String>()),
+                }
+            }
+
+            if len > 0 {
+                //println!("Read {} bytes", String::from_utf8(buffer[0..len].to_vec()).unwrap());
+                if let Err(_)=socket.write_all(&buffer[0..len]).await {
+                    break;
+                }
+            }
         }
     }
 
-    runtime.shutdown_background();
+    ntrip_handle.await??;
 
-    Ok(())
+    return Ok(());
 }
 
-async fn check_if_exit() -> ResultHere<()> {
-    let mut buffer = String::new();
-    stdin().read_line(&mut buffer).unwrap();
-    Ok(())
+async fn copy_ntrip_data(mut ntrip_fix: Response<Incoming>, mut port: WriteHalf<SerialStream>) -> ResultHere<()> {
+        while let Some(next) = ntrip_fix.frame().await {
+            let mut frame = next?;
+
+            #[allow(unused_mut)]
+            if let Some(chunk) = frame.data_mut() {
+                println!("Send correction {} bytes", chunk.len());
+                port.write_all(&chunk).await?;
+            }
+        }
+        Ok(()) as ResultHere<()>
 }
 
-
-async fn fetch_url(url: &str) -> ResultHere<()> {
+async fn ntrip_fix(url: &str) -> ResultHere<Response<Incoming>> {
     let url = url.parse::<hyper::Uri>().unwrap();
     if url.scheme_str() != Some("http") {
         return Err(Box::new(Error::new(std::io::ErrorKind::InvalidInput, "This example only works with 'http' URLs.")));
@@ -93,28 +111,33 @@ async fn fetch_url(url: &str) -> ResultHere<()> {
     let req = Request::builder()
         .uri(url)
         .header(hyper::header::HOST, authority.as_str())
-        //.header("User-Agent", "NTRIP TnlAgClient/1.0")
+        .header("User-Agent", "NTRIP GpsCorrect/1.0")
         .version(Version::HTTP_11)
         .body(Empty::<Bytes>::new())?;
 
     let mut res = sender.send_request(req).await?;
 
-    println!("Response: {}", res.status());
-    if !res.status().is_success(){
+    if !res.status().is_success() {
         return Err(Box::new(Error::new(std::io::ErrorKind::NotConnected, "The response is not success !")));
     }
-    //println!("Headers: {:#?}\n", res.headers());
 
-    // Stream the body, writing each chunk to stdout as we get it
-    // (instead of buffering and printing at the end).
-    while let Some(next) = res.frame().await {
-        let frame = next?;
-        if let Some(chunk) = frame.data_ref() {
-            io::stdout().write_all(&chunk).await?;
+    if let Some(next) = res.frame().await {
+        let mut frame = next?;
+
+        #[allow(unused_mut)]
+        if let Some(chunk) = frame.data_mut() {
+            println!("---------------");
+            // Check the first string is "ICY 200 OK\n\\n" and remove it
+            let chunk_str = String::from_utf8(chunk[0..14].to_vec()).unwrap();
+            if chunk_str != "ICY 200 OK\r\n\r\n" {
+                return Err(Box::new(Error::new(std::io::ErrorKind::NotConnected, "The response is not success !")));
+            } else {
+                println!("Ntrip server initialized !")
+            }
         }
     }
 
-    println!("Ntrip server done !");
+    println!("Ntrip server ok !");
 
-    Ok(())
+    Ok(res)
 }
