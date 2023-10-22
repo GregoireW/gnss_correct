@@ -45,6 +45,30 @@ async fn main() -> ResultHere<()> {
         let read_result =  port_reader.read(&mut buffer).await;
         if let Ok(len) = read_result {
             let s=String::from_utf8(buffer[0..len].to_vec()).unwrap();
+            /*
+            TALKER ID 	XX 	All talker IDs usable => GN here as multi GNSS solution
+            SENTECE ID 	GGA
+            UTC of position 	hhmmss.ss 	Fixed length 2 digits after dot
+            Latitude 	llll.lllllll 	Fixed length 4 digits before and 7 after dot
+            Hemisphere of latitude 	N/S 	N if value of latitude is positive
+            Longitude 	lllll.lllllll 	Fixed length 5 digits before and 7 after dot
+            Hemisphere of longitude 	E/W 	E if value of longitude is positive
+            GPS quality indicator 	X 	0: GNSS fix not available
+                1: GNSS fix valid
+                4: RTK fixed ambiguities
+                5: RTK float ambiguities
+            Number of satellites used for positioning 	XX 	Fixed length  01 for single digits
+            HDOP 	XX.X 	Variable/fixed length 1 digit after dot, variable before
+            Altitude geoid height 	(-)X.XX 	Variable/fixed length 2 digits after dot, variable before
+            Unit of altitude 	M
+            Geoidal separation 	(-)X.XX 	Variable/fixed length 2 digits after dot, variable before
+            Unit of geoidal separation 	M
+            Age of differential data 		Empty field
+            Differential reference station ID 		Empty field
+
+            checksum 	*XX 	2 digits
+            */
+
             let index = s.find("$GNGGA");
             if let Some(start)=index {
                 match s.chars().skip(start).collect::<String>().find("\r") {
