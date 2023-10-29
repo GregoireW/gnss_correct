@@ -1,7 +1,13 @@
 #![deny(warnings)]
 #![warn(rust_2018_idioms)]
+
+use gtk::prelude::*;
+use gtk::{Application, ApplicationWindow, Button, Grid};
+
+
 use std::io::{Error};
 use bytes::Bytes;
+use gtk::glib::ExitCode;
 use hyper::{Request, Response, Version};
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
@@ -18,19 +24,27 @@ use crate::app_utils::ResultHere;
 use crate::io_utils::TokioIo;
 
 #[tokio::main]
-async fn main() -> ResultHere<()> {
-    let url = "http://caster.centipede.fr:2101/GDCRT";
+async fn main() -> ExitCode {
+    let app = Application::builder().application_id("GPS correct").build();
 
-    #[cfg(unix)]
-    const COM: &str = "/dev/ttyACM0";
-    #[cfg(windows)]
-    const COM: &str = "COM3";
+    // Connect to "activate" signal of `app`
+    app.connect_activate(build_ui);
 
-    println!("Will connect to {} and {}", url, COM);
+    // Run the application
+    return app.run();
+}
 
-    let ntrip_fix = ntrip_fix(url).await?;
+async fn start_process(url: String, com_port: String) -> ResultHere<()> {
+    let com = match cfg!(unix) {
+        true => "/dev/".to_owned()+com_port.as_str(),
+        false => com_port.to_string(),
+    };
 
-    let port = tokio_serial::new(COM, 115200).open_native_async().unwrap();
+    println!("Will connect to {} and {}", url, com);
+
+    let ntrip_fix = ntrip_fix(url.as_str()).await?;
+
+    let port = tokio_serial::new(com, 115200).open_native_async().unwrap();
     let (mut port_reader, port_writer) = tokio::io::split(port);
 
     let ntrip_handle=tokio::spawn(copy_ntrip_data(ntrip_fix, port_writer));
@@ -89,6 +103,84 @@ async fn main() -> ResultHere<()> {
     ntrip_handle.await??;
 
     return Ok(());
+}
+
+fn build_ui(app: &Application) {
+    // Create a button with label and margins
+    let button = Button::builder()
+        .label("Start correction")
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+
+
+    let port_lst= list_serial();
+    let port_lst2: Vec<&str> = port_lst.iter().map(|s| s.as_str()).collect();
+    let port_choice = gtk::DropDown::from_strings(port_lst2.as_slice());
+
+    let ntrip_url = gtk::Entry::new();
+    ntrip_url.set_text("http://caster.centipede.fr:2101/GDCRT");
+
+
+    let grid = Grid::new();
+    grid.set_row_homogeneous(true);
+    grid.set_column_homogeneous(true);
+
+    grid.attach(&gtk::Label::new(Option::Some("GNSS receiver")), 0, 0, 1, 1);
+    grid.attach(&port_choice, 1, 0, 1, 1);
+    grid.attach(&gtk::Label::new(Option::Some("NTRIP correction mountpoint")), 0, 1, 1, 1);
+    grid.attach(&ntrip_url, 1, 1, 1, 1);
+    grid.attach(&button, 0,2,2,1);
+
+
+    // Connect to "clicked" signal of `button`
+    button.connect_clicked( move |button| {
+        let url=ntrip_url.text().to_string();
+        let port=port_lst[port_choice.selected() as usize].to_string();
+        tokio::spawn(start_process(url, port));
+
+        //button.set_label("Hello World!");
+        button.set_sensitive(false);
+    });
+
+
+
+    // Create a window
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("GPS correct")
+        .child(&grid)
+        .build();
+
+    // Present window
+    window.present();
+}
+
+fn list_serial() ->Vec<String>{
+    let ports=tokio_serial::available_ports();
+    if let Err(e)=ports {
+        println!("Error {}", e);
+        return Vec::new();
+    }
+
+    let port=match ports{
+        Ok(p)=>p,
+        Err(e)=>{
+            println!("Error {}", e);
+            return Vec::new();
+        }
+    };
+    let mut ret=Vec::new();
+
+    for p in port {
+        println!("Found port {}", p.port_name);
+        // Add the last part of "/" separated string into ret vector
+        ret.push(p.port_name.split("/").last().unwrap().to_string());
+    }
+
+    return ret;
 }
 
 async fn copy_ntrip_data(mut ntrip_fix: Response<Incoming>, mut port: WriteHalf<SerialStream>) -> ResultHere<()> {
